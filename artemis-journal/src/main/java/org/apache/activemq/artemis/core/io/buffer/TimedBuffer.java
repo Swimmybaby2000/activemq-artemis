@@ -33,7 +33,7 @@ import org.apache.activemq.artemis.core.journal.EncodingSupport;
 import org.apache.activemq.artemis.core.journal.impl.dataformat.ByteArrayEncoding;
 import org.apache.activemq.artemis.journal.ActiveMQJournalLogger;
 
-public class TimedBuffer {
+public class TimedBuffer implements WriteBuffer {
    // Constants -----------------------------------------------------
 
    // The number of tries on sleep before switching to spin
@@ -125,6 +125,7 @@ public class TimedBuffer {
       this.useSleep = useSleep;
    }
 
+   @Override
    public synchronized void start() {
       if (started) {
          return;
@@ -152,6 +153,7 @@ public class TimedBuffer {
       started = true;
    }
 
+   @Override
    public void stop() {
       if (!started) {
          return;
@@ -180,6 +182,7 @@ public class TimedBuffer {
       started = false;
    }
 
+   @Override
    public synchronized void setObserver(final TimedBufferObserver observer) {
       if (bufferObserver != null) {
          flush();
@@ -193,6 +196,7 @@ public class TimedBuffer {
     *
     * @param sizeChecked
     */
+   @Override
    public synchronized boolean checkSize(final int sizeChecked) {
       if (!started) {
          throw new IllegalStateException("TimedBuffer is not started");
@@ -231,10 +235,12 @@ public class TimedBuffer {
       }
    }
 
+   @Override
    public synchronized void addBytes(final ActiveMQBuffer bytes, final boolean sync, final IOCallback callback) {
       addBytes(new ByteArrayEncoding(bytes.toByteBuffer().array()), sync, callback);
    }
 
+   @Override
    public synchronized void addBytes(final EncodingSupport bytes, final boolean sync, final IOCallback callback) {
       if (!started) {
          throw new IllegalStateException("TimedBuffer is not started");
@@ -254,6 +260,7 @@ public class TimedBuffer {
 
    }
 
+   @Override
    public void flush() {
       flush(false);
    }

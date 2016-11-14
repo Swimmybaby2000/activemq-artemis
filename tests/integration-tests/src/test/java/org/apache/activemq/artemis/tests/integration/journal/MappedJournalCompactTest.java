@@ -32,6 +32,6 @@ public class MappedJournalCompactTest extends NIOJournalCompactTest {
 
       file.mkdir();
 
-      return new MappedSequentialFileFactory(getTestDirfile());
+      return new MappedSequentialFileFactory(getTestDirfile(), this.fileSize);
    }
 }

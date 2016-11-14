@@ -18,12 +18,15 @@
 package org.apache.activemq.artemis.core.io;
 
 import java.io.File;
+import java.nio.file.Files;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.LockSupport;
 import java.util.stream.Stream;
 
@@ -31,13 +34,13 @@ import io.netty.util.internal.shaded.org.jctools.queues.MpscArrayQueue;
 import org.apache.activemq.artemis.ArtemisConstants;
 import org.apache.activemq.artemis.api.core.ActiveMQBuffer;
 import org.apache.activemq.artemis.core.io.aio.AIOSequentialFileFactory;
+import org.apache.activemq.artemis.core.io.mapped.batch.BatchWriteBuffer;
 import org.apache.activemq.artemis.core.io.mapped.MappedSequentialFileFactory;
 import org.apache.activemq.artemis.core.io.nio.NIOSequentialFileFactory;
 import org.apache.activemq.artemis.core.journal.EncodingSupport;
 import org.apache.activemq.artemis.core.journal.Journal;
 import org.apache.activemq.artemis.core.journal.RecordInfo;
 import org.apache.activemq.artemis.core.journal.impl.JournalImpl;
-import org.apache.activemq.artemis.core.journal.impl.SimpleWaitIOCallback;
 import org.apache.activemq.artemis.jlibaio.LibaioContext;
 
 /**
@@ -46,25 +49,30 @@ import org.apache.activemq.artemis.jlibaio.LibaioContext;
 public class JournalTptBenchmark {
 
    public static void main(String[] args) throws Exception {
+      final int producers = 3;
       final boolean useDefaultIoExecutor = true;
-      final int fileSize = 1024 * 1024;
+      final int fileSize = 10 * 1024 * 1024;
+      final boolean supportCallbacks = true;
       final boolean dataSync = true;
       final Type type = Type.Mapped;
-      final int tests = 5;
-      final int warmup = 20_000;
-      final int measurements = 20_000;
-      final int msgSize = 100;
+      final boolean useWriteBuffer = true;
+      final int tests = 8;
+      final int warmup = 10_000;
+      final int measurements = 10_000;
+      final int msgSize = 1000;
       final byte[] msgContent = new byte[msgSize];
       Arrays.fill(msgContent, (byte) 1);
-      final int totalMessages = (measurements * tests + warmup);
-      final File tmpDirectory = new File("./");
+      final File tmpDirectory = new File("./tmp");
+      Files.createDirectory(tmpDirectory.toPath());
+      tmpDirectory.deleteOnExit();
       //using the default configuration when the broker starts!
       final SequentialFileFactory factory;
       switch (type) {
 
          case Mapped:
-            final MappedSequentialFileFactory mappedFactory = new MappedSequentialFileFactory(tmpDirectory, null, true);
-            factory = mappedFactory.chunkBytes(fileSize).overlapBytes(0).setDatasync(dataSync);
+            final BatchWriteBuffer writeBuffer = useWriteBuffer ? new BatchWriteBuffer(ArtemisConstants.DEFAULT_JOURNAL_BUFFER_SIZE_AIO) : null;
+            final MappedSequentialFileFactory mappedFactory = new MappedSequentialFileFactory(tmpDirectory, fileSize, null, supportCallbacks, writeBuffer);
+            factory = mappedFactory.setDatasync(dataSync);
             break;
          case Nio:
             factory = new NIOSequentialFileFactory(tmpDirectory, true, ArtemisConstants.DEFAULT_JOURNAL_BUFFER_SIZE_NIO, ArtemisConstants.DEFAULT_JOURNAL_BUFFER_TIMEOUT_NIO, 1, false, null).setDatasync(dataSync);
@@ -79,11 +87,7 @@ public class JournalTptBenchmark {
          default:
             throw new AssertionError("unsupported case");
       }
-
-      int numFiles = (int) (totalMessages * factory.calculateBlockSize(msgSize)) / fileSize;
-      if (numFiles < 2) {
-         numFiles = 2;
-      }
+      int numFiles = 2;
       ExecutorService service = null;
       final Journal journal;
       if (useDefaultIoExecutor) {
@@ -154,18 +158,42 @@ public class JournalTptBenchmark {
 
             }
          };
-         long id = 1;
-         {
-            final long elapsed = writeMeasurements(id, journal, encodingSupport, warmup);
-            id += warmup;
-            System.out.println("warmup:" + (measurements * 1000_000_000L) / elapsed + " ops/sec");
+         final AtomicLong idGenerator = new AtomicLong(0);
+         final CountDownLatch warmUpLatch = new CountDownLatch(producers);
+         final CountDownLatch[] testsLatch = new CountDownLatch[tests];
+         for (int i = 0; i < tests; i++) {
+            testsLatch[i] = new CountDownLatch(producers);
          }
-         for (int t = 0; t < tests; t++) {
-            final long elapsed = writeMeasurements(id, journal, encodingSupport, measurements);
-            System.out.println((measurements * 1000_000_000L) / elapsed + " ops/sec");
-            id += warmup;
-         }
+         final Thread[] producersTasks = new Thread[producers];
+         for (int i = 0; i < producers; i++) {
+            producersTasks[i] = new Thread(() -> {
+               try {
+                  {
+                     warmUpLatch.countDown();
+                     warmUpLatch.await();
+                     final long elapsed = writeMeasurements(idGenerator, journal, encodingSupport, warmup);
+                     System.out.println("WARMUP @ [" + Thread.currentThread() + "] - " + (measurements * 1000_000_000L) / elapsed + " ops/sec");
+                  }
 
+                  for (int t = 0; t < tests; t++) {
+                     testsLatch[t].countDown();
+                     testsLatch[t].await();
+                     final long elapsed = writeMeasurements(idGenerator, journal, encodingSupport, measurements);
+                     System.out.println((t + 1) + " @ [" + Thread.currentThread() + "] - " + ((measurements * 1000_000_000L) / elapsed) + " ops/sec");
+                  }
+               } catch (Throwable e) {
+                  e.printStackTrace();
+               }
+            });
+         }
+         Stream.of(producersTasks).forEach(Thread::start);
+         Stream.of(producersTasks).forEach(t -> {
+            try {
+               t.join();
+            } catch (Throwable tr) {
+               tr.printStackTrace();
+            }
+         });
       } finally {
          journal.stop();
          if (service != null) {
@@ -177,17 +205,15 @@ public class JournalTptBenchmark {
       }
    }
 
-   private static long writeMeasurements(long id,
+   private static long writeMeasurements(AtomicLong id,
                                          Journal journal,
                                          EncodingSupport encodingSupport,
                                          int measurements) throws Exception {
-      System.gc();
       TimeUnit.SECONDS.sleep(2);
 
       final long start = System.nanoTime();
       for (int i = 0; i < measurements; i++) {
-         write(id, journal, encodingSupport);
-         id++;
+         write(id.getAndIncrement(), journal, encodingSupport);
       }
       final long elapsed = System.nanoTime() - start;
       return elapsed;
@@ -195,9 +221,7 @@ public class JournalTptBenchmark {
 
    private static void write(long id, Journal journal, EncodingSupport encodingSupport) throws Exception {
       journal.appendAddRecord(id, (byte) 1, encodingSupport, false);
-      final SimpleWaitIOCallback ioCallback = new SimpleWaitIOCallback();
-      journal.appendUpdateRecord(id, (byte) 1, encodingSupport, true, ioCallback);
-      ioCallback.waitCompletion();
+      journal.appendUpdateRecord(id, (byte) 1, encodingSupport, true);
    }
 
    private enum Type {

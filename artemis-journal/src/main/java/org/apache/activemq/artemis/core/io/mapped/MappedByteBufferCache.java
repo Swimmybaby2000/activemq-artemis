@@ -28,6 +28,7 @@ import java.nio.channels.FileLock;
 import java.util.ArrayList;
 
 import io.netty.util.internal.PlatformDependent;
+import org.apache.activemq.artemis.utils.BytesUtils;
 
 final class MappedByteBufferCache implements AutoCloseable {
 

@@ -20,6 +20,7 @@ import java.io.File;
 import java.io.IOException;
 import java.io.RandomAccessFile;
 import java.nio.ByteBuffer;
+import java.nio.MappedByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.channels.FileLock;
 
@@ -30,7 +31,7 @@ import org.apache.activemq.artemis.api.core.ActiveMQIOErrorException;
 import org.apache.activemq.artemis.core.io.IOCallback;
 import org.apache.activemq.artemis.core.io.IOCriticalErrorListener;
 import org.apache.activemq.artemis.core.io.SequentialFile;
-import org.apache.activemq.artemis.core.io.buffer.TimedBuffer;
+import org.apache.activemq.artemis.core.io.buffer.WriteBuffer;
 import org.apache.activemq.artemis.core.journal.EncodingSupport;
 import org.apache.activemq.artemis.journal.ActiveMQJournalBundle;
 import org.apache.activemq.artemis.journal.ActiveMQJournalLogger;
@@ -38,30 +39,31 @@ import org.apache.activemq.artemis.journal.ActiveMQJournalLogger;
 final class MappedSequentialFile implements SequentialFile {
 
    private final File directory;
-   private final long chunkBytes;
-   private final long overlapBytes;
    private final IOCriticalErrorListener criticalErrorListener;
    private final MappedSequentialFileFactory factory;
    private File file;
    private File absoluteFile;
    private String fileName;
    private MappedFile mappedFile;
+   private int capacity;
 
    MappedSequentialFile(MappedSequentialFileFactory factory,
                         final File directory,
                         final File file,
-                        final long chunkBytes,
-                        final long overlapBytes,
+                        final int capacity,
                         final IOCriticalErrorListener criticalErrorListener) {
       this.factory = factory;
       this.directory = directory;
       this.file = file;
       this.absoluteFile = null;
       this.fileName = null;
-      this.chunkBytes = chunkBytes;
-      this.overlapBytes = overlapBytes;
+      this.capacity = capacity;
       this.mappedFile = null;
       this.criticalErrorListener = criticalErrorListener;
+   }
+
+   public int capacity() {
+      return this.capacity;
    }
 
    private void checkIsOpen() {
@@ -95,7 +97,18 @@ final class MappedSequentialFile implements SequentialFile {
    @Override
    public void open() throws IOException {
       if (this.mappedFile == null) {
-         this.mappedFile = MappedFile.of(file, chunkBytes, overlapBytes);
+         final MappedByteBuffer buffer;
+         final int length;
+         try (final RandomAccessFile raf = new RandomAccessFile(file, "rw")) {
+            try (FileChannel channel = raf.getChannel()) {
+               length = (int) channel.size();
+               if (length != capacity && length != 0) {
+                  throw new IllegalStateException("the file is not " + capacity + " bytes long!");
+               }
+               buffer = channel.map(FileChannel.MapMode.READ_WRITE, 0, capacity);
+            }
+         }
+         this.mappedFile = MappedFile.of(buffer, 0, length);
       }
    }
 
@@ -130,6 +143,9 @@ final class MappedSequentialFile implements SequentialFile {
    public void fill(int size) throws IOException {
       checkIsOpen();
       this.mappedFile.zeros(this.mappedFile.position(), size);
+      if (factory.isDatasync()) {
+         this.mappedFile.force();
+      }
    }
 
    @Override
@@ -240,6 +256,28 @@ final class MappedSequentialFile implements SequentialFile {
       }
    }
 
+   public void writeDirect(ByteBuffer bytes, final int index, final int length, boolean sync, IOCallback callback) {
+      if (callback == null) {
+         throw new NullPointerException("callback parameter need to be set");
+      }
+      checkIsOpen(callback);
+      try {
+         if (length > 0) {
+            this.mappedFile.write(bytes, index, length);
+            if (factory.isDatasync() && sync) {
+               this.mappedFile.force();
+            }
+         }
+         callback.done();
+      } catch (IOException e) {
+         if (this.criticalErrorListener != null) {
+            this.criticalErrorListener.onIOException(new ActiveMQIOErrorException(e.getMessage(), e), e.getMessage(), this);
+         }
+         callback.onError(ActiveMQExceptionType.IO_ERROR.getCode(), e.getMessage());
+         throw new RuntimeException(e);
+      }
+   }
+
    @Override
    public void writeDirect(ByteBuffer bytes, boolean sync) throws IOException {
       checkIsOpen();
@@ -304,8 +342,11 @@ final class MappedSequentialFile implements SequentialFile {
 
    @Override
    public void position(long pos) {
+      if (pos > Integer.MAX_VALUE) {
+         throw new IllegalArgumentException("pos must be < " + Integer.MAX_VALUE);
+      }
       checkIsOpen();
-      this.mappedFile.position(pos);
+      this.mappedFile.position((int) pos);
    }
 
    @Override
@@ -317,7 +358,7 @@ final class MappedSequentialFile implements SequentialFile {
    @Override
    public void close() {
       if (this.mappedFile != null) {
-         this.mappedFile.closeAndResize(this.mappedFile.length());
+         this.mappedFile.close();
          this.mappedFile = null;
       }
    }
@@ -325,7 +366,9 @@ final class MappedSequentialFile implements SequentialFile {
    @Override
    public void sync() throws IOException {
       checkIsOpen();
-      this.mappedFile.force();
+      if (factory.isDatasync()) {
+         this.mappedFile.force();
+      }
    }
 
    @Override
@@ -363,9 +406,9 @@ final class MappedSequentialFile implements SequentialFile {
    }
 
    @Override
-   public SequentialFile cloneFile() {
+   public MappedSequentialFile cloneFile() {
       checkIsNotOpen();
-      return new MappedSequentialFile(factory, this.directory, this.file, this.chunkBytes, this.overlapBytes, this.criticalErrorListener);
+      return new MappedSequentialFile(factory, this.directory, this.file, this.capacity, this.criticalErrorListener);
    }
 
    @Override
@@ -393,7 +436,7 @@ final class MappedSequentialFile implements SequentialFile {
 
    @Override
    @Deprecated
-   public void setTimedBuffer(TimedBuffer buffer) {
+   public void setTimedBuffer(WriteBuffer buffer) {
       throw new UnsupportedOperationException("the timed buffer is not currently supported");
    }
 

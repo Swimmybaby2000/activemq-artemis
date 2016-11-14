@@ -44,6 +44,7 @@ import org.apache.activemq.artemis.core.io.IOCriticalErrorListener;
 import org.apache.activemq.artemis.core.io.SequentialFile;
 import org.apache.activemq.artemis.core.io.SequentialFileFactory;
 import org.apache.activemq.artemis.core.io.aio.AIOSequentialFileFactory;
+import org.apache.activemq.artemis.core.io.mapped.batch.BatchWriteBuffer;
 import org.apache.activemq.artemis.core.io.mapped.MappedSequentialFileFactory;
 import org.apache.activemq.artemis.core.io.nio.NIOSequentialFileFactory;
 import org.apache.activemq.artemis.core.journal.Journal;
@@ -138,7 +139,7 @@ public class JournalStorageManager extends AbstractJournalStorageManager {
          case MAPPED:
             ActiveMQServerLogger.LOGGER.journalUseMAPPED();
             //the mapped version do not need buffering by default
-            journalFF = new MappedSequentialFileFactory(config.getJournalLocation(), criticalErrorListener, true).chunkBytes(config.getJournalFileSize()).overlapBytes(0);
+            journalFF = new MappedSequentialFileFactory(config.getJournalLocation(), config.getJournalFileSize(), criticalErrorListener, true, config.isJournalDatasync() ? new BatchWriteBuffer(config.getJournalBufferSize_AIO()) : null);
             break;
          default:
             throw ActiveMQMessageBundle.BUNDLE.invalidJournalType2(config.getJournalType());
